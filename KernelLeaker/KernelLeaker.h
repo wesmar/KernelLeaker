@@ -22,7 +22,7 @@ namespace kaslr {
 
     private:
         CpuVendor vendor_;
-        mutable uint32_t avg_timing_ = 0;  // Cached average for current measurement batch
+        mutable uint64_t avg_timing_ = 0;  // Cached average for current measurement batch
         int verbose_;
 
         // CPU vendor detection via processor brand string query

